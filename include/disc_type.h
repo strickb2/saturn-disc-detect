@@ -15,6 +15,7 @@ enum disc_type {
   DISC_BD_R = 0x0041,         // also profile 0x42, both print "BD_R"
   DISC_BD_R_RANDOM = 0x0042,
   DISC_BD_RE = 0x0043,
+  DISC_SS_CD_ROM = 0x10008,
   DISC_PS1_CD_ROM = 0xFF50,   // -176
   DISC_PS2_CD_ROM = 0xFF60,   // -160
   DISC_PS2_DVD_ROM = 0xFF61,  // -159

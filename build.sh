@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Configure and build both payloads. Release is the default.
+# Configure and build available payloads. Release is the default.
 #   ./build.sh
 #   ./build.sh Debug
-set -euo pipefail
+set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$root"
@@ -19,20 +19,37 @@ esac
 export PS4_PAYLOAD_SDK="${PS4_PAYLOAD_SDK:-/opt/ps4-payload-sdk}"
 export PS5_PAYLOAD_SDK="${PS5_PAYLOAD_SDK:-/opt/ps5-payload-sdk}"
 
-if [ ! -x "$PS4_PAYLOAD_SDK/bin/orbis-cmake" ] || [ ! -x "$PS5_PAYLOAD_SDK/bin/prospero-cmake" ]; then
+have_ps4=false
+have_ps5=false
+[ ! -x "$PS4_PAYLOAD_SDK/bin/orbis-cmake" ] || have_ps4=true
+[ ! -x "$PS5_PAYLOAD_SDK/bin/prospero-cmake" ] || have_ps5=true
+
+if [ "$have_ps4" = false ] && [ "$have_ps5" = false ]; then
   echo "PS4 and PS5 payload SDKs were not found. Run this from WSL, where they live under /opt." >&2
   exit 1
 fi
 
 jobs=$(nproc 2>/dev/null || echo 1)
 
-echo "Building PS4 ($build_type)"
-"$PS4_PAYLOAD_SDK/bin/orbis-cmake" -S "$root" -B "$root/build/ps4" -DCMAKE_BUILD_TYPE="$build_type"
-cmake --build "$root/build/ps4" -j"$jobs"
+if [ "$have_ps4" = true ]; then
+  echo "Building PS4 ($build_type)"
+  "$PS4_PAYLOAD_SDK/bin/orbis-cmake" -S "$root" -B "$root/build/ps4" -DCMAKE_BUILD_TYPE="$build_type"
+  cmake --build "$root/build/ps4" -j"$jobs"
+else
+  echo "Skipping PS4: orbis-cmake not found at $PS4_PAYLOAD_SDK/bin/orbis-cmake" >&2
+fi
 
-echo "Building PS5 ($build_type)"
-"$PS5_PAYLOAD_SDK/bin/prospero-cmake" -S "$root" -B "$root/build/ps5" -DCMAKE_BUILD_TYPE="$build_type"
-cmake --build "$root/build/ps5" -j"$jobs"
+if [ "$have_ps5" = true ]; then
+  echo "Building PS5 ($build_type)"
+  "$PS5_PAYLOAD_SDK/bin/prospero-cmake" -S "$root" -B "$root/build/ps5" -DCMAKE_BUILD_TYPE="$build_type"
+  cmake --build "$root/build/ps5" -j"$jobs"
+else
+  echo "Skipping PS5: prospero-cmake not found at $PS5_PAYLOAD_SDK/bin/prospero-cmake" >&2
+fi
 
-echo "PS4: $root/build/bin/disc-ps4.elf"
-echo "PS5: $root/build/bin/disc-ps5.elf"
+if [ "$have_ps4" = true ]; then
+  echo "PS4: $root/build/bin/disc-ps4.elf"
+fi
+if [ "$have_ps5" = true ]; then
+  echo "PS5: $root/build/bin/saturn-disc-detect.elf"
+fi

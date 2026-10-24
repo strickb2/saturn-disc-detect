@@ -26,7 +26,7 @@ elseif(PROSPERO)
     message(FATAL_ERROR "PS5_PAYLOAD_SDK path does not exist: $ENV{PS5_PAYLOAD_SDK}")
   endif()
   add_compile_definitions(__PROSPERO__)
-  set(PAYLOAD_NAME "disc-ps5.elf")
+  set(PAYLOAD_NAME "saturn-disc-detect.elf")
   set(DISC_BUILD_REL "build/ps5")
   set(DISC_BUILD_DIR "${CMAKE_SOURCE_DIR}/build/ps5")
   message(STATUS "Platform Type: Prospero (PlayStation 5)")
@@ -168,6 +168,7 @@ add_executable(disc
   src/param_json.cpp
   src/system_cnf.c
   src/disc_title.c
+  src/notify.c
   src/redump.c
   src/sqlite_vfs.c
   "${REDUMP_OBJ}"

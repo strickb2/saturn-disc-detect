@@ -12,6 +12,35 @@
 #include <cam/scsi/scsi_pass.h>
 
 #include "detect_disc.h"
+#include "notify.h"
+
+#if defined(__ORBIS__) && defined(__PROSPERO__)
+#error "Define only one of __ORBIS__ or __PROSPERO__"
+#elif defined(__ORBIS__)
+#include <ps4/klog.h>
+#elif defined(__PROSPERO__)
+#include <ps5/klog.h>
+#else
+#error "Build for PS4 (__ORBIS__) or PS5 (__PROSPERO__)"
+#endif
+
+// Temporary. While 1, what the drive answers during Saturn detection goes to klog and to a
+// notification, once each time the answer changes. Set it to 0 when detection works.
+#define DISC_DIAG 1
+
+#if DISC_DIAG
+#define DIAG(...)                                          \
+  do {                                                     \
+    char diag_buf[200];                                    \
+    snprintf(diag_buf, sizeof(diag_buf), __VA_ARGS__);     \
+    klog_printf("[Diag] %s\n", diag_buf);                  \
+    notify("%s", diag_buf);                                \
+  } while (0)
+#else
+#define DIAG(...) \
+  do {            \
+  } while (0)
+#endif
 
 /*
  * PS4 headers report CAM_VERSION 0x17, but that kernel still encodes 0x16
@@ -64,6 +93,9 @@ static uint32_t decode_sense(const uint8_t *s) {
 // Commands are not nested, so one CCB is reused instead of allocating one per read.
 static union ccb cam_ccb;
 
+// CAM status of the last command, for the Saturn diagnostics.
+static uint32_t cam_last_status;
+
 static union ccb *cam_ccb_get(void) {
   memset(&cam_ccb, '\0', sizeof(cam_ccb));
   return &cam_ccb;
@@ -88,6 +120,7 @@ static int scsi_cmd(int fd, uint32_t path, uint32_t target, uint32_t lun, const 
   memcpy(ccb->csio.cdb_io.cdb_bytes, cdb, cdb_len);
 
   rc = ioctl(fd, DISC_CAMIOCOMMAND, ccb);
+  cam_last_status = rc < 0 ? 0xFFFFFFFFu : (uint32_t)ccb->csio.ccb_h.status;
   if (rc < 0) {
     if (sense_out) {
       *sense_out = 0;
@@ -143,7 +176,32 @@ static int get_passthru(int fd, const char *name, uint32_t unit, char *out_name,
   return 0;
 }
 
-static int open_cd0(uint32_t *path, uint32_t *target, uint32_t *lun) {
+/*
+ * The CD unit that disc_pass_open() and disc_dev_path() follow.
+ * A PS5 Digital Edition has no internal drive, so a USB reader is cd0 there.
+ * A Disc Edition's internal drive is cd0, and a USB reader is a later unit.
+ * pick_unit() moves to whichever unit holds a disc.
+ */
+#define DISC_MAX_UNITS 4
+
+static uint32_t cd_unit;
+static char cd_dev_path[24] = "/dev/cd0";
+
+const char *disc_dev_path(void) {
+  return cd_dev_path;
+}
+
+// CAM status of the last command sent. 0xFFFFFFFF means the ioctl itself failed.
+uint32_t disc_cam_status(void) {
+  return cam_last_status;
+}
+
+static void select_unit(uint32_t unit) {
+  cd_unit = unit;
+  snprintf(cd_dev_path, sizeof(cd_dev_path), "/dev/cd%u", (unsigned)unit);
+}
+
+static int open_cd(uint32_t unit, uint32_t *path, uint32_t *target, uint32_t *lun) {
   int xpt;
   int fd;
   char pass_name[16];
@@ -154,7 +212,7 @@ static int open_cd0(uint32_t *path, uint32_t *target, uint32_t *lun) {
   if (xpt < 0) {
     return -1;
   }
-  if (get_passthru(xpt, "cd", 0, pass_name, &pass_unit, NULL, NULL, NULL) != 0) {
+  if (get_passthru(xpt, "cd", unit, pass_name, &pass_unit, NULL, NULL, NULL) != 0) {
     close(xpt);
     return -1;
   }
@@ -181,7 +239,7 @@ int disc_pass_open(struct disc_pass *pass) {
   if (!pass) {
     return -1;
   }
-  fd = open_cd0(&path, &target, &lun);
+  fd = open_cd(cd_unit, &path, &target, &lun);
   if (fd < 0) {
     pass->fd = -1;
     return -1;
@@ -346,6 +404,104 @@ static enum disc_type classify_sense(uint32_t sense) {
   return DISC_ERROR;
 }
 
+// Profile 0 is an empty tray on this drive.
+static int unit_has_disc(uint32_t unit) {
+  uint32_t path = 0;
+  uint32_t target = 0;
+  uint32_t lun = 0;
+  uint32_t sense = 0;
+  uint16_t profile = 0;
+  int fd;
+  int has;
+
+  fd = open_cd(unit, &path, &target, &lun);
+  if (fd < 0) {
+    return 0;
+  }
+  has = read_profile(fd, path, target, lun, &profile, &sense) == 0 && profile != 0;
+  close(fd);
+  return has;
+}
+
+// Stay on the current unit while it holds a disc. Otherwise move to the first unit that does.
+// With no disc anywhere the current unit is kept, so detect_disc() reports its empty tray.
+static void pick_unit(void) {
+  uint32_t unit;
+
+  if (unit_has_disc(cd_unit)) {
+    return;
+  }
+  for (unit = 0; unit < DISC_MAX_UNITS; unit++) {
+    if (unit != cd_unit && unit_has_disc(unit)) {
+      select_unit(unit);
+      return;
+    }
+  }
+}
+
+// A Saturn disc starts with "SEGA SEGASATURN " at the start of its system area (LBA 0).
+// The 2048 user bytes of LBA 0 are kept for disc_saturn_header(), so the title needs no other read.
+#define SS_SIG "SEGA SEGASATURN "
+
+static uint8_t ss_header[2048];
+static int ss_header_valid;
+
+int disc_saturn_header(uint8_t out[2048]) {
+  if (!ss_header_valid) {
+    return 0;
+  }
+  memcpy(out, ss_header, sizeof(ss_header));
+  return 1;
+}
+
+// READ CD, any sector type, LBA 0, one sector. Byte 9 picks the return: user data only, or the whole raw sector.
+// Some readers refuse the first form, so the raw sector is the fallback. The dump itself reads raw sectors.
+static int is_saturn_disc(int fd, uint32_t path, uint32_t target, uint32_t lun) {
+  static const uint8_t user_cdb[12] = {0xBE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10, 0x00, 0x00};
+  static const uint8_t raw_cdb[12] = {0xBE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xF8, 0x00, 0x00};
+  static int last_state = -1;
+  uint8_t raw[2352];
+  uint32_t sense1 = 0;
+  uint32_t sense2 = 0;
+  uint32_t cam1;
+  uint32_t cam2 = 0;
+  int rc1;
+  int rc2 = -2;
+  int found = 0;
+  int state;
+
+  ss_header_valid = 0;
+  memset(ss_header, '\0', sizeof(ss_header));
+  rc1 = scsi_cmd(fd, path, target, lun, user_cdb, 12, ss_header, sizeof(ss_header), CAM_DIR_IN, 10000, &sense1);
+  cam1 = cam_last_status;
+  if (rc1 == 0 && memcmp(ss_header, SS_SIG, 16) == 0) {
+    found = 1;
+  } else {
+    memset(raw, '\0', sizeof(raw));
+    rc2 = scsi_cmd(fd, path, target, lun, raw_cdb, 12, raw, sizeof(raw), CAM_DIR_IN, 10000, &sense2);
+    cam2 = cam_last_status;
+    if (rc2 == 0) {
+      // User data starts 16 bytes into a Mode 1 sector and 24 into a Mode 2 Form 1 sector.
+      if (memcmp(raw + 16, SS_SIG, 16) == 0) {
+        memcpy(ss_header, raw + 16, sizeof(ss_header));
+        found = 1;
+      } else if (memcmp(raw + 24, SS_SIG, 16) == 0) {
+        memcpy(ss_header, raw + 24, sizeof(ss_header));
+        found = 1;
+      }
+    }
+  }
+  ss_header_valid = found;
+
+  state = (found ? 1 : 0) | (rc1 == 0 ? 2 : 0) | (rc2 == 0 ? 4 : 0) | (rc2 == -2 ? 8 : 0);
+  if (state != last_state) {
+    last_state = state;
+    DIAG("Saturn probe %s: user rc=%d cam=%#x sns=%06x b=%02X%02X%02X%02X, raw rc=%d cam=%#x sns=%06x", found ? "OK" : "FAILED", rc1, (unsigned)cam1, (unsigned)sense1,
+         ss_header[0], ss_header[1], ss_header[2], ss_header[3], rc2, (unsigned)cam2, (unsigned)sense2);
+  }
+  return found;
+}
+
 enum disc_type detect_disc(void) {
   uint32_t path = 0;
   uint32_t target = 0;
@@ -360,7 +516,8 @@ enum disc_type detect_disc(void) {
   static const uint8_t inquiry_cdb[6] = {0x12, 0x00, 0x00, 0x00, 36, 0x00};
 #endif
 
-  fd = open_cd0(&path, &target, &lun);
+  pick_unit();
+  fd = open_cd(cd_unit, &path, &target, &lun);
   if (fd < 0) {
     return DISC_ERROR;
   }
@@ -398,6 +555,23 @@ ready:
     profile = DISC_PS4_BD_ROM;
   }
 #endif
+
+  {
+    static int diag_profile = -1;
+
+    if ((int)profile != diag_profile) {
+      diag_profile = (int)profile;
+      DIAG("cd%u profile %#x", (unsigned)cd_unit, (unsigned)profile);
+    }
+  }
+
+  // The drive reports a plain CD profile for a Saturn disc, so it is told apart by its header.
+  if (profile == 0x08 || profile == 0x09 || profile == 0x0A) {
+    if (is_saturn_disc(fd, path, target, lun)) {
+      close(fd);
+      return DISC_SS_CD_ROM;
+    }
+  }
 
   if (wants_disc_structure(profile)) {
     unsigned book = 0;

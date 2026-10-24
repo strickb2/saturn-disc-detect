@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "detect_disc.h"
 #include "disc_mount.h"
 #include "disc_serial.h"
 #include "disc_title.h"
@@ -17,12 +18,13 @@
  *
  * PS1: SYSTEM.CNF BOOT=, else the PVD volume ID. PSX.EXE in that line falls back to the PVD.
  * PS2: SYSTEM.CNF BOOT2=.
+ * SS: the product number in the IP.BIN header at LBA 0, 10 bytes at offset 0x20.
  * PS3: TITLE_ID in PS3_GAME/PARAM.SFO. Field max length is 16. Logged as XXXX-YYYYY.
  * PS4: TITLE_ID in bd/param.sfo, after its 0x800-byte header. Field max length is 12.
  *      Otherwise the 9-character directory name under app/. Logged as XXXX-YYYYY.
  * PS5: first PS5GD contentId in bd/param.json, the 9 bytes at [7, 16).
  *      Otherwise the 9-character directory name under app/. Logged as XXXX-YYYYY.
- * A disc whose title read fails yields GENERIC_PS1, GENERIC_PS2, GENERIC_PS3, GENERIC_PS4, or GENERIC_PS5.
+ * A disc whose title read fails yields GENERIC_PS1, GENERIC_SS, GENERIC_PS2, GENERIC_PS3, GENERIC_PS4, or GENERIC_PS5.
  *
  * Returns:
  * 1 and writes dest
@@ -32,8 +34,6 @@
 
 #define SECTOR_SIZE 0x800
 #define ISO_PVD_SECTOR 0x10
-
-static const char DISC_DEV[] = "/dev/cd0";
 
 static int serial_is_psx_exe(const char *serial) {
   return serial && (strcmp(serial, "PSXEXE") == 0 || strcmp(serial, "PSX-EXE") == 0);
@@ -47,7 +47,7 @@ static void read_pvd_serial(char *dest, size_t dest_len) {
     return;
   }
   dest[0] = '\0';
-  fd = open(DISC_DEV, O_RDONLY);
+  fd = open(disc_dev_path(), O_RDONLY);
   if (fd < 0) {
     return;
   }
@@ -154,6 +154,31 @@ static int title_ps2(char *dest, size_t dest_len) {
   return 1;
 }
 
+static int title_ss(char *dest, size_t dest_len) {
+  unsigned char sector[SECTOR_SIZE];
+  char id[11];
+  int i;
+
+  // detect_disc() read LBA 0 when it identified the disc. No block device or mount is involved.
+  if (!disc_saturn_header(sector)) {
+    return -1;
+  }
+  if (memcmp(sector, "SEGA SEGASATURN ", 16) != 0) {
+    set_serial(dest, dest_len, "GENERIC_SS");
+    return 1;
+  }
+  memcpy(id, sector + 0x20, 10);
+  id[10] = '\0';
+  for (i = 9; i >= 0 && (id[i] == ' ' || id[i] == '\0'); i--) {
+    id[i] = '\0';
+  }
+  sanitize_serial(id, dest, dest_len);
+  if (dest[0] == '\0') {
+    set_serial(dest, dest_len, "GENERIC_SS");
+  }
+  return 1;
+}
+
 static int title_ps3(char *dest, size_t dest_len) {
   unsigned char *buf = NULL;
   size_t n = 0;
@@ -227,6 +252,7 @@ static int title_ps5(char *dest, size_t dest_len) {
 int disc_has_title(enum disc_type type) {
   switch (type) {
   case DISC_PS1_CD_ROM:
+  case DISC_SS_CD_ROM:
   case DISC_PS2_CD_ROM:
   case DISC_PS2_DVD_ROM:
   case DISC_PS3_DVD_ROM:
@@ -247,6 +273,8 @@ int disc_title_id(enum disc_type type, char *dest, size_t dest_len) {
   switch (type) {
   case DISC_PS1_CD_ROM:
     return title_ps1(dest, dest_len);
+  case DISC_SS_CD_ROM:
+    return title_ss(dest, dest_len);
   case DISC_PS2_CD_ROM:
   case DISC_PS2_DVD_ROM:
     return title_ps2(dest, dest_len);

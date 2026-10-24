@@ -1,3 +1,16 @@
+# Saturn Disc Detect
+
+Fork of ps-disc-detect that detects Sega Saturn games using an external CD reader, and dumps them to the PS5's hard drive within Retroarch's Saturn ROMs folder.
+Additional debug information has been included, and will be displayed via toasts on the PS5's screen, to notify the user of dump begin/success. Dump errors will also display on failure.
+Error handling has also been included:
+- Chunk failure: the dump reads 16 sectors at a time. When a chunk fails with sense key 3 (e.g. because the disc is scratched/dirty), it re-reads that chunk one sector at a time. Only the sectors that still fail are lost.
+- Skipped sectors: each lost sector is written as 2352 zero bytes, so the .bin keeps its exact size and layout and the .cue stays valid.
+Any other failure still aborts the dump. A drive that goes not-ready or loses the disc would otherwise leave an image of zeros.
+- Abort limit: the dump aborts if more than 16,384 sectors (about 38 MB) are unreadable, so a dead disc doesn’t keep the drive retrying for hours. The limit is DUMP_MAX_BAD_SECTORS at the top of that block, and you can change it.
+
+**NOTE:** Read, write and execute permissions must be enabled for Retroarch's Saturn ROMs folder in order for the dump to begin successfully.
+
+------------------------------------------------------------------------------------------------------------------------------------
 # disc detect
 
 A PlayStation 4 and PlayStation 5 payload that watches the optical drive. It reports the disc the same way ShellCore does, logs the profile and title ID, and dumps PlayStation, PlayStation 2, and PlayStation 3 discs to `/data`.

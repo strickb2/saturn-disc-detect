@@ -29,6 +29,8 @@ const char *disc_type_name(int type) {
     return "BD_RE";
   case DISC_PS1_CD_ROM:
     return "PS1 CD-ROM";
+  case DISC_SS_CD_ROM:
+    return "SEGA SATURN CD-ROM";
   case DISC_PS2_CD_ROM:
     return "PS2 CD-ROM";
   case DISC_PS2_DVD_ROM:

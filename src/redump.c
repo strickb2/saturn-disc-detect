@@ -561,6 +561,10 @@ int redump_verify(const char *serial, const char *image_path, const struct disc_
     matched = match_size_tracks(fd, whole, name, name_len);
   } else {
     matched = match_serial_tracks(fd, serial, whole, name, name_len);
+    // A serial the DAT spells differently, or lacks, still matches by size and track hashes.
+    if (!matched) {
+      matched = match_size_tracks(fd, whole, name, name_len);
+    }
   }
   close(fd);
   return matched;

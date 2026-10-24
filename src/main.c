@@ -6,6 +6,7 @@
 #include "disc_serial.h"
 #include "disc_title.h"
 #include "dump_loaded.h"
+#include "notify.h"
 #include "redump.h"
 
 #if defined(__ORBIS__) && defined(__PROSPERO__)
@@ -38,6 +39,7 @@ int main(void) {
 
   shown[0] = '\0';
   klog_puts("Optical Drive Monitor Started... Ready for disc insertion.");
+  notify("Optical drive monitor started");
 
   while (1) {
     enum disc_type type = detect_disc();

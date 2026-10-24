@@ -6,6 +6,7 @@ With no DAT paths, the script downloads these zips and deletes them afterward:
     https://redump.info/datfile/PSX/serial,version
     https://redump.info/datfile/PS2/serial,version
     https://redump.info/datfile/PS3/serial,version
+    https://redump.info/datfile/SS/serial,version
 
 Each game in those files has a <serial> child. A <version> child may be
 present and is not stored. The plain Redump DAT has checksums and names,
@@ -60,6 +61,7 @@ SERIAL_DAT_URLS = (
     "https://redump.info/datfile/PSX/serial,version",
     "https://redump.info/datfile/PS2/serial,version",
     "https://redump.info/datfile/PS3/serial,version",
+    "https://redump.info/datfile/SS/serial,version",
 )
 # Redump answers 403 when the request has no User-Agent.
 REDUMP_USER_AGENT = "Mozilla/5.0"

@@ -1,6 +1,8 @@
 #include <ctype.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +17,17 @@
 #include "disc_hash.h"
 #include "disc_ird.h"
 #include "disc_mount.h"
+#include "notify.h"
+
+#if defined(__ORBIS__) && defined(__PROSPERO__)
+#error "Define only one of __ORBIS__ or __PROSPERO__"
+#elif defined(__ORBIS__)
+#include <ps4/klog.h>
+#elif defined(__PROSPERO__)
+#include <ps5/klog.h>
+#else
+#error "Build for PS4 (__ORBIS__) or PS5 (__PROSPERO__)"
+#endif
 
 /*
  * Copy the optical drive to an image file.
@@ -27,6 +40,9 @@
  * stem: the image is stem.bin and the sheet is stem.cue. Track times in the
  * sheet are relative to the first track, which is the start of the bin.
  *
+ * A CD sector the drive reports as unreadable (a medium error) does not stop the dump.
+ * It is written as zeros so the image keeps its layout, and dump_disc_bad_sectors() says how many.
+ *
  * Returns 0 when the image is complete, or -1 if it could not be written.
  * A failed attempt removes the files it created.
  *
@@ -35,8 +51,6 @@
  * type selects the image format. hash, when set, receives the checksums of
  * the ISO or the CD bin.
  */
-
-static const char DISC_DEV[] = "/dev/cd0";
 
 // One kernel transfer. MAXPHYS on these systems is 128KB(?)
 #define DUMP_CHUNK (128 * 1024)
@@ -58,6 +72,95 @@ struct cd_toc {
   unsigned count;
   uint32_t leadout;
 };
+
+// Why the last dump failed, for the caller to show. Empty when no reason was recorded.
+static char dump_err[200];
+
+static void set_err(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void set_err(const char *fmt, ...) {
+  va_list ap;
+
+  va_start(ap, fmt);
+  vsnprintf(dump_err, sizeof(dump_err), fmt, ap);
+  va_end(ap);
+}
+
+const char *dump_disc_error(void) {
+  return dump_err;
+}
+
+// A dump that skips more than this many unreadable sectors (about 38 MiB) is given up, so a dead disc
+// does not keep the drive retrying for hours.
+#define DUMP_MAX_BAD_SECTORS 16384u
+
+// Unreadable CD sectors skipped by the current dump, and the run of neighbours being counted.
+static uint32_t bad_count;
+static uint32_t bad_runs;
+static uint32_t bad_first;
+static uint32_t bad_last;
+static uint32_t run_start;
+static uint32_t run_len;
+
+static void reset_bad(void) {
+  bad_count = 0;
+  bad_runs = 0;
+  bad_first = 0;
+  bad_last = 0;
+  run_start = 0;
+  run_len = 0;
+}
+
+static void flush_bad_run(void) {
+  if (run_len > 0) {
+    klog_printf("[Dump] unreadable: LBA %u to %u (%u sectors), written as zeros\n", (unsigned)run_start, (unsigned)(run_start + run_len - 1), (unsigned)run_len);
+    run_len = 0;
+  }
+}
+
+static void note_bad_sector(uint32_t lba, uint32_t sense) {
+  if (bad_count == 0) {
+    bad_first = lba;
+    klog_printf("[Dump] read error at LBA %u (sense %06x), skipping unreadable sectors\n", (unsigned)lba, (unsigned)sense);
+    notify("Read error at LBA %u: skipping unreadable sectors", (unsigned)lba);
+  }
+  if (run_len > 0 && lba == run_start + run_len) {
+    run_len++;
+  } else {
+    flush_bad_run();
+    run_start = lba;
+    run_len = 1;
+    bad_runs++;
+  }
+  bad_count++;
+  bad_last = lba;
+}
+
+// How many unreadable sectors the last CD dump wrote as zeros, with the first and last LBA and the number of runs.
+uint32_t dump_disc_bad_sectors(uint32_t *first, uint32_t *last, uint32_t *runs) {
+  if (first) {
+    *first = bad_first;
+  }
+  if (last) {
+    *last = bad_last;
+  }
+  if (runs) {
+    *runs = bad_runs;
+  }
+  return bad_count;
+}
+
+// Sense key 3 is a medium error: the drive tried and could not read that sector. Any other failure
+// (not ready, no disc, a refused command) is not skipped, because it would only give an image of zeros.
+static int sense_is_medium_error(uint32_t sense) {
+  return (sense >> 16) == 0x03u;
+}
+
+// Sense 05/64: the sector is not the kind the read asked for, such as an audio sector read with the data flags.
+// A data track ends with the lead-in of the audio track after it, which is audio, so this is expected there.
+static int sense_is_illegal_mode(uint32_t sense) {
+  return (sense >> 8) == 0x0564u;
+}
 
 static int write_full(int fd, const unsigned char *buf, size_t n) {
   size_t off = 0;
@@ -209,7 +312,7 @@ static int dump_block(const char *path, disc_dump_progress_fn progress, void *us
     *ird_out = NULL;
   }
 
-  dev = open(DISC_DEV, O_RDONLY);
+  dev = open(disc_dev_path(), O_RDONLY);
   if (dev < 0) {
     return -1;
   }
@@ -291,7 +394,7 @@ static int dump_block(const char *path, disc_dump_progress_fn progress, void *us
 static int profile_is_cd(enum disc_type type) {
   unsigned profile = (unsigned)type;
 
-  return profile == 0x08u || profile == 0x09u || profile == 0x0Au || profile == (unsigned)DISC_PS1_CD_ROM || profile == (unsigned)DISC_PS2_CD_ROM;
+  return profile == 0x08u || profile == 0x09u || profile == 0x0Au || profile == (unsigned)DISC_PS1_CD_ROM || profile == (unsigned)DISC_PS2_CD_ROM || profile == (unsigned)DISC_SS_CD_ROM;
 }
 
 static int ends_with(const char *s, const char *suf) {
@@ -363,7 +466,9 @@ static int read_toc(struct disc_pass *pass, struct cd_toc *toc) {
   cdb[0] = 0x43;
   cdb[7] = 0x08;
   memset(data, '\0', sizeof(data));
-  if (disc_pass_scsi(pass, cdb, 10, data, sizeof(data), 10000, NULL) != 0) {
+  uint32_t sense = 0;
+  if (disc_pass_scsi(pass, cdb, 10, data, sizeof(data), 10000, &sense) != 0) {
+    set_err("READ TOC failed: cam %#x sense %06x", (unsigned)disc_cam_status(), (unsigned)sense);
     return -1;
   }
 
@@ -372,6 +477,7 @@ static int read_toc(struct disc_pass *pass, struct cd_toc *toc) {
     total = sizeof(data);
   }
   if (total < 12) {
+    set_err("TOC too short (%u bytes)", total);
     return -1;
   }
 
@@ -394,6 +500,7 @@ static int read_toc(struct disc_pass *pass, struct cd_toc *toc) {
     count++;
   }
   if (!saw_lead || count == 0) {
+    set_err("TOC has no lead-out or no tracks");
     return -1;
   }
   toc->count = count;
@@ -401,6 +508,7 @@ static int read_toc(struct disc_pass *pass, struct cd_toc *toc) {
     uint32_t next = (i + 1 < count) ? toc->tracks[i + 1].lba : toc->leadout;
 
     if (next <= toc->tracks[i].lba) {
+      set_err("TOC track %u is out of order", (unsigned)toc->tracks[i].number);
       return -1;
     }
   }
@@ -425,7 +533,7 @@ int disc_image_bytes(enum disc_type type, uint64_t *out) {
     *out = (uint64_t)(toc.leadout - toc.tracks[0].lba) * CD_SECTOR;
     return 0;
   } else {
-    int dev = open(DISC_DEV, O_RDONLY);
+    int dev = open(disc_dev_path(), O_RDONLY);
     off_t media = -1;
 
     if (dev < 0) {
@@ -452,20 +560,23 @@ static int probe_mode(struct disc_pass *pass, struct cd_track *track) {
   uint8_t sector[CD_SECTOR];
   uint8_t cdb[12];
 
+  uint32_t sense = 0;
+
   memset(sector, '\0', sizeof(sector));
   read_cd_cdb(cdb, track->lba, 1, 1);
-  if (disc_pass_scsi(pass, cdb, 12, sector, sizeof(sector), 20000, NULL) != 0) {
+  if (disc_pass_scsi(pass, cdb, 12, sector, sizeof(sector), 20000, &sense) != 0) {
+    set_err("raw read of track %u (LBA %u) failed: cam %#x sense %06x", (unsigned)track->number, (unsigned)track->lba, (unsigned)disc_cam_status(), (unsigned)sense);
     return -1;
   }
   track->mode = sector_mode(sector);
   return 0;
 }
 
-static int read_cd(struct disc_pass *pass, uint32_t lba, uint32_t count, int data, uint8_t *buf) {
+static int read_cd(struct disc_pass *pass, uint32_t lba, uint32_t count, int data, uint8_t *buf, uint32_t *sense) {
   uint8_t cdb[12];
 
   read_cd_cdb(cdb, lba, count, data);
-  return disc_pass_scsi(pass, cdb, 12, buf, count * CD_SECTOR, 20000, NULL);
+  return disc_pass_scsi(pass, cdb, 12, buf, count * CD_SECTOR, 20000, sense);
 }
 
 static int dump_tracks(struct disc_pass *pass, int bin, const struct cd_toc *toc, struct disc_hash_ctx *hash, disc_dump_progress_fn progress, void *user) {
@@ -481,14 +592,62 @@ static int dump_tracks(struct disc_pass *pass, int bin, const struct cd_toc *toc
   for (i = 0; i < toc->count; i++) {
     uint32_t lba = toc->tracks[i].lba;
     uint32_t end = (i + 1 < toc->count) ? toc->tracks[i + 1].lba : toc->leadout;
+    // The sector kind the drive is asked for: 1 data, 0 audio. It flips when the drive says a sector is the other kind.
+    // A data track's last sectors are the audio lead-in of the next track, and a drive will not return those as data.
+    int mode = toc->tracks[i].data != 0;
 
     while (lba < end) {
       uint32_t n = end - lba;
+      uint32_t sense = 0;
 
       if (n > CD_CHUNK) {
         n = CD_CHUNK;
       }
-      if (read_cd(pass, lba, n, toc->tracks[i].data, buf) != 0 || write_full(bin, buf, (size_t)n * CD_SECTOR) != 0) {
+      if (read_cd(pass, lba, n, mode, buf, &sense) != 0) {
+        uint32_t s;
+
+        if (!sense_is_medium_error(sense) && !sense_is_illegal_mode(sense)) {
+          set_err("read of LBA %u failed: cam %#x sense %06x", (unsigned)lba, (unsigned)disc_cam_status(), (unsigned)sense);
+          free(buf);
+          return -1;
+        }
+        // Read the chunk again one sector at a time, so only the sectors that fail are lost.
+        for (s = 0; s < n; s++) {
+          uint8_t *dst = buf + (size_t)s * CD_SECTOR;
+          int rc;
+
+          sense = 0;
+          rc = read_cd(pass, lba + s, 1, mode, dst, &sense);
+          if (rc != 0 && sense_is_illegal_mode(sense)) {
+            uint32_t other = 0;
+
+            if (read_cd(pass, lba + s, 1, !mode, dst, &other) == 0) {
+              mode = !mode;
+              klog_printf("[Dump] LBA %u reads as %s, reading the rest of the track that way\n", (unsigned)(lba + s), mode ? "data" : "audio");
+              rc = 0;
+            }
+          }
+          if (rc == 0) {
+            continue;
+          }
+          if (!sense_is_medium_error(sense)) {
+            set_err("read of LBA %u failed: cam %#x sense %06x", (unsigned)(lba + s), (unsigned)disc_cam_status(), (unsigned)sense);
+            flush_bad_run();
+            free(buf);
+            return -1;
+          }
+          memset(dst, '\0', CD_SECTOR);
+          note_bad_sector(lba + s, sense);
+          if (bad_count > DUMP_MAX_BAD_SECTORS) {
+            set_err("gave up after %u unreadable sectors (last LBA %u)", (unsigned)bad_count, (unsigned)(lba + s));
+            flush_bad_run();
+            free(buf);
+            return -1;
+          }
+        }
+      }
+      if (write_full(bin, buf, (size_t)n * CD_SECTOR) != 0) {
+        set_err("write failed: errno %d", errno);
         free(buf);
         return -1;
       }
@@ -500,6 +659,7 @@ static int dump_tracks(struct disc_pass *pass, int bin, const struct cd_toc *toc
       report_progress(progress, user, done, total);
     }
   }
+  flush_bad_run();
   free(buf);
   return 0;
 }
@@ -544,9 +704,11 @@ static int dump_cd(const char *path, struct disc_hash *hash_out, disc_dump_progr
 
   pass.fd = -1;
   if (cd_paths(path, bin_path, sizeof(bin_path), cue_path, sizeof(cue_path)) != 0 || !cue_name_ok(base_name(bin_path))) {
+    set_err("unusable image path");
     return -1;
   }
   if (disc_pass_open(&pass) != 0) {
+    set_err("cannot open the drive");
     return -1;
   }
   disc_request_read_speed(0);
@@ -561,16 +723,24 @@ static int dump_cd(const char *path, struct disc_hash *hash_out, disc_dump_progr
     }
   }
 
-  bin = open(bin_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  bin = open(bin_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (bin < 0) {
+    set_err("cannot create %s: errno %d", bin_path, errno);
     disc_pass_close(&pass);
     return -1;
   }
+  // Open to other users on the console, so the emulator that plays the image can read it whatever the umask was.
+  (void)fchmod(bin, 0666);
   disc_hash_init(&hash_ctx);
   if (dump_tracks(&pass, bin, &toc, hash_out ? &hash_ctx : NULL, progress, user) == 0 && fsync_retry(bin) == 0) {
-    cue = open(cue_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    cue = open(cue_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (cue >= 0) {
+      (void)fchmod(cue, 0666);
+    }
     if (cue >= 0 && write_cue(cue, base_name(bin_path), &toc) == 0 && fsync_retry(cue) == 0) {
       rc = 0;
+    } else {
+      set_err("cannot write %s: errno %d", cue_path, errno);
     }
   }
 
@@ -592,6 +762,8 @@ static int dump_cd(const char *path, struct disc_hash *hash_out, disc_dump_progr
 }
 
 int dump_disc(enum disc_type type, const char *path, struct disc_hash *hash, disc_dump_progress_fn progress, void *user) {
+  dump_err[0] = '\0';
+  reset_bad();
   if (!path || path[0] == '\0' || type == DISC_NOT_PRESENT || type == DISC_TIMEOUT || type == DISC_ERROR) {
     return -1;
   }
@@ -602,6 +774,8 @@ int dump_disc(enum disc_type type, const char *path, struct disc_hash *hash, dis
 }
 
 int dump_ps3(const char *path, struct disc_ird **ird_out, struct disc_hash *hash, disc_dump_progress_fn progress, void *user) {
+  dump_err[0] = '\0';
+  reset_bad();
   if (!path || path[0] == '\0') {
     return -1;
   }
